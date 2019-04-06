@@ -3,9 +3,9 @@ package db
 import (
 	"bytes"
 	"database/sql"
-	"github.com/OpenBazaar/wallet-interface"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/muecoin/wallet-interface"
+	"github.com/muecoin/btcd/chaincfg/chainhash"
+	"github.com/muecoin/btcd/wire"
 	"sync"
 	"time"
 )
@@ -15,7 +15,7 @@ type TxnsDB struct {
 	lock *sync.RWMutex
 }
 
-func (t *TxnsDB) Put(txn []byte, txid string, value, height int, timestamp time.Time, watchOnly bool) error {
+func (t *TxnsDB) Put(txn *wire.MsgTx, value, height int, timestamp time.Time, watchOnly bool) error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	tx, err := t.db.Begin()
@@ -28,11 +28,13 @@ func (t *TxnsDB) Put(txn []byte, txid string, value, height int, timestamp time.
 		tx.Rollback()
 		return err
 	}
+	var buf bytes.Buffer
+	txn.BtcEncode(&buf, wire.ProtocolVersion, wire.WitnessEncoding)
 	watchOnlyInt := 0
 	if watchOnly {
 		watchOnlyInt = 1
 	}
-	_, err = stmt.Exec(txid, value, height, int(timestamp.Unix()), watchOnlyInt, txn)
+	_, err = stmt.Exec(txn.TxHash().String(), value, height, int(timestamp.Unix()), watchOnlyInt, buf.Bytes())
 	if err != nil {
 		tx.Rollback()
 		return err
@@ -41,13 +43,13 @@ func (t *TxnsDB) Put(txn []byte, txid string, value, height int, timestamp time.
 	return nil
 }
 
-func (t *TxnsDB) Get(txid chainhash.Hash) (wallet.Txn, error) {
+func (t *TxnsDB) Get(txid chainhash.Hash) (*wire.MsgTx, wallet.Txn, error) {
 	t.lock.RLock()
 	defer t.lock.RUnlock()
 	var txn wallet.Txn
 	stmt, err := t.db.Prepare("select tx, value, height, timestamp, watchOnly from txns where txid=?")
 	if err != nil {
-		return txn, err
+		return nil, txn, err
 	}
 	defer stmt.Close()
 	var ret []byte
@@ -57,7 +59,7 @@ func (t *TxnsDB) Get(txid chainhash.Hash) (wallet.Txn, error) {
 	var watchOnlyInt int
 	err = stmt.QueryRow(txid.String()).Scan(&ret, &value, &height, &timestamp, &watchOnlyInt)
 	if err != nil {
-		return txn, err
+		return nil, txn, err
 	}
 	r := bytes.NewReader(ret)
 	msgTx := wire.NewMsgTx(1)
@@ -72,9 +74,8 @@ func (t *TxnsDB) Get(txid chainhash.Hash) (wallet.Txn, error) {
 		Height:    int32(height),
 		Timestamp: time.Unix(int64(timestamp), 0),
 		WatchOnly: watchOnly,
-		Bytes:     ret,
 	}
-	return txn, nil
+	return msgTx, txn, nil
 }
 
 func (t *TxnsDB) GetAll(includeWatchOnly bool) ([]wallet.Txn, error) {
@@ -107,14 +108,7 @@ func (t *TxnsDB) GetAll(includeWatchOnly bool) ([]wallet.Txn, error) {
 			watchOnly = true
 		}
 
-		txn := wallet.Txn{
-			Txid:      msgTx.TxHash().String(),
-			Value:     int64(value),
-			Height:    int32(height),
-			Timestamp: time.Unix(int64(timestamp), 0),
-			WatchOnly: watchOnly,
-			Bytes:     tx,
-		}
+		txn := wallet.Txn{msgTx.TxHash().String(), int64(value), int32(height), time.Unix(int64(timestamp), 0), watchOnly, tx}
 		ret = append(ret, txn)
 	}
 	return ret, nil
@@ -130,19 +124,19 @@ func (t *TxnsDB) Delete(txid *chainhash.Hash) error {
 	return nil
 }
 
-func (t *TxnsDB) UpdateHeight(txid chainhash.Hash, height int, timestamp time.Time) error {
+func (t *TxnsDB) UpdateHeight(txid chainhash.Hash, height int) error {
 	t.lock.Lock()
 	defer t.lock.Unlock()
 	tx, err := t.db.Begin()
 	if err != nil {
 		return err
 	}
-	stmt, err := tx.Prepare("update txns set height=?, timestamp=? where txid=?")
+	stmt, err := tx.Prepare("update txns set height=? where txid=?")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
-	_, err = stmt.Exec(height, int(timestamp.Unix()), txid.String())
+	_, err = stmt.Exec(height, txid.String())
 	if err != nil {
 		tx.Rollback()
 		return err

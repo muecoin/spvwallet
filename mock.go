@@ -4,10 +4,10 @@ import (
 	"bytes"
 	"encoding/hex"
 	"errors"
-	"github.com/OpenBazaar/wallet-interface"
-	"github.com/btcsuite/btcd/btcec"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"github.com/muecoin/wallet-interface"
+	"github.com/muecoin/btcd/btcec"
+	"github.com/muecoin/btcd/chaincfg/chainhash"
+	"github.com/muecoin/btcd/wire"
 	"sort"
 	"strconv"
 	"testing"
@@ -225,48 +225,56 @@ func (m *mockStxoStore) Delete(stxo wallet.Stxo) error {
 	return nil
 }
 
-type mockTxnStore struct {
-	txns map[string]*wallet.Txn
+type txnStoreEntry struct {
+	txn       *wire.MsgTx
+	value     int
+	height    int
+	timestamp time.Time
+	watchOnly bool
 }
 
-func (m *mockTxnStore) Put(raw []byte, txid string, value, height int, timestamp time.Time, watchOnly bool) error {
-	m.txns[txid] = &wallet.Txn{
-		Txid:      txid,
-		Value:     int64(value),
-		Height:    int32(height),
-		Timestamp: timestamp,
-		WatchOnly: watchOnly,
-		Bytes:     raw,
+type mockTxnStore struct {
+	txns map[string]*txnStoreEntry
+}
+
+func (m *mockTxnStore) Put(txn *wire.MsgTx, value, height int, timestamp time.Time, watchOnly bool) error {
+	m.txns[txn.TxHash().String()] = &txnStoreEntry{
+		txn:       txn,
+		value:     value,
+		height:    height,
+		timestamp: timestamp,
+		watchOnly: watchOnly,
 	}
 	return nil
 }
 
-func (m *mockTxnStore) Get(txid chainhash.Hash) (wallet.Txn, error) {
+func (m *mockTxnStore) Get(txid chainhash.Hash) (*wire.MsgTx, wallet.Txn, error) {
 	t, ok := m.txns[txid.String()]
 	if !ok {
-		return wallet.Txn{}, errors.New("Not found")
+		return nil, wallet.Txn{}, errors.New("Not found")
 	}
-	return *t, nil
+	var buf bytes.Buffer
+	t.txn.Serialize(&buf)
+	return t.txn, wallet.Txn{txid.String(), int64(t.value), int32(t.height), t.timestamp, t.watchOnly, buf.Bytes()}, nil
 }
 
 func (m *mockTxnStore) GetAll(includeWatchOnly bool) ([]wallet.Txn, error) {
 	var txns []wallet.Txn
 	for _, t := range m.txns {
-		if !includeWatchOnly && t.WatchOnly {
-			continue
-		}
-		txns = append(txns, *t)
+		var buf bytes.Buffer
+		t.txn.Serialize(&buf)
+		txn := wallet.Txn{t.txn.TxHash().String(), int64(t.value), int32(t.height), t.timestamp, t.watchOnly, buf.Bytes()}
+		txns = append(txns, txn)
 	}
 	return txns, nil
 }
 
-func (m *mockTxnStore) UpdateHeight(txid chainhash.Hash, height int, timestamp time.Time) error {
+func (m *mockTxnStore) UpdateHeight(txid chainhash.Hash, height int) error {
 	txn, ok := m.txns[txid.String()]
 	if !ok {
 		return errors.New("Not found")
 	}
-	txn.Height = int32(height)
-	txn.Timestamp = timestamp
+	txn.height = height
 	return nil
 }
 

@@ -2,21 +2,21 @@ package spvwallet
 
 import (
 	"errors"
-	"github.com/OpenBazaar/spvwallet/exchangerates"
-	"github.com/OpenBazaar/wallet-interface"
-	"github.com/btcsuite/btcd/btcec"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/peer"
-	"github.com/btcsuite/btcd/txscript"
-	btc "github.com/btcsuite/btcutil"
-	hd "github.com/btcsuite/btcutil/hdkeychain"
-	"github.com/btcsuite/btcwallet/wallet/txrules"
-	"github.com/op/go-logging"
-	b39 "github.com/tyler-smith/go-bip39"
 	"io"
 	"sync"
 	"time"
+
+	"github.com/op/go-logging"
+	"github.com/muecoin/btcd/btcec"
+	"github.com/muecoin/btcd/chaincfg"
+	"github.com/muecoin/btcd/chaincfg/chainhash"
+	"github.com/muecoin/btcd/peer"
+	"github.com/muecoin/btcd/txscript"
+	btc "github.com/muecoin/btcutil"
+	hd "github.com/muecoin/btcutil/hdkeychain"
+	"github.com/muecoin/btcwallet/wallet/txrules"
+	"github.com/muecoin/wallet-interface"
+	b39 "github.com/tyler-smith/go-bip39"
 )
 
 type SPVWallet struct {
@@ -35,9 +35,9 @@ type SPVWallet struct {
 	txstore     *TxStore
 	peerManager *PeerManager
 	keyManager  *KeyManager
-	wireService *WireService
 
 	fPositives    chan *peer.Peer
+	stopChan      chan int
 	fpAccumulator map[int32]int32
 	mutex         *sync.RWMutex
 
@@ -46,8 +46,6 @@ type SPVWallet struct {
 	running bool
 
 	config *PeerManagerConfig
-
-	exchangeRates wallet.ExchangeRates
 }
 
 var log = logging.MustGetLogger("bitcoin")
@@ -96,14 +94,9 @@ func NewSPVWallet(config *Config) (*SPVWallet, error) {
 			config.Proxy,
 		),
 		fPositives:    make(chan *peer.Peer),
+		stopChan:      make(chan int),
 		fpAccumulator: make(map[int32]int32),
 		mutex:         new(sync.RWMutex),
-	}
-
-	bpf := exchangerates.NewBitcoinPriceFetcher(config.Proxy)
-	w.exchangeRates = bpf
-	if !config.DisableExchangeRates {
-		go bpf.Run()
 	}
 
 	w.keyManager, err = NewKeyManager(config.DB.Keys(), w.params, w.masterPrivateKey)
@@ -117,38 +110,38 @@ func NewSPVWallet(config *Config) (*SPVWallet, error) {
 	if err != nil {
 		return nil, err
 	}
-	minSync := 5
-	if config.TrustedPeer != nil {
-		minSync = 1
-	}
-	wireConfig := &WireServiceConfig{
-		txStore:            w.txstore,
-		chain:              w.blockchain,
-		walletCreationDate: w.creationDate,
-		minPeersForSync:    minSync,
-		params:             w.params,
-	}
 
-	ws := NewWireService(wireConfig)
-	w.wireService = ws
+	listeners := &peer.MessageListeners{
+		OnMerkleBlock: w.onMerkleBlock,
+		OnInv:         w.onInv,
+		OnTx:          w.onTx,
+		OnGetData:     w.onGetData,
+		OnReject:      w.onReject,
+	}
 
 	getNewestBlock := func() (*chainhash.Hash, int32, error) {
-		sh, err := w.blockchain.BestBlock()
+		storedHeader, err := w.blockchain.db.GetBestHeader()
 		if err != nil {
 			return nil, 0, err
 		}
-		h := sh.header.BlockHash()
-		return &h, int32(sh.height), nil
+		height, err := w.blockchain.db.Height()
+		if err != nil {
+			return nil, 0, err
+		}
+		hash := storedHeader.header.BlockHash()
+		return &hash, int32(height), nil
 	}
 
 	w.config = &PeerManagerConfig{
-		UserAgentName:    config.UserAgent,
-		UserAgentVersion: WALLET_VERSION,
-		Params:           w.params,
-		AddressCacheDir:  config.RepoPath,
-		Proxy:            config.Proxy,
-		GetNewestBlock:   getNewestBlock,
-		MsgChan:          ws.MsgChan(),
+		UserAgentName:      config.UserAgent,
+		UserAgentVersion:   WALLET_VERSION,
+		Params:             w.params,
+		AddressCacheDir:    config.RepoPath,
+		GetFilter:          w.txstore.GimmeFilter,
+		StartChainDownload: w.startChainDownload,
+		GetNewestBlock:     getNewestBlock,
+		Listeners:          listeners,
+		Proxy:              config.Proxy,
 	}
 
 	if config.TrustedPeer != nil {
@@ -165,8 +158,8 @@ func NewSPVWallet(config *Config) (*SPVWallet, error) {
 
 func (w *SPVWallet) Start() {
 	w.running = true
-	go w.wireService.Start()
 	go w.peerManager.Start()
+	w.fPositiveHandler(w.stopChan)
 }
 
 //////////////////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -195,31 +188,12 @@ func (w *SPVWallet) MasterPublicKey() *hd.ExtendedKey {
 	return w.masterPublicKey
 }
 
-func (w *SPVWallet) ChildKey(keyBytes []byte, chaincode []byte, isPrivateKey bool) (*hd.ExtendedKey, error) {
-	parentFP := []byte{0x00, 0x00, 0x00, 0x00}
-	var id []byte
-	if isPrivateKey {
-		id = w.params.HDPrivateKeyID[:]
-	} else {
-		id = w.params.HDPublicKeyID[:]
-	}
-	hdKey := hd.NewExtendedKey(
-		id,
-		keyBytes,
-		chaincode,
-		parentFP,
-		0,
-		0,
-		isPrivateKey)
-	return hdKey.Child(0)
-}
-
 func (w *SPVWallet) Mnemonic() string {
 	return w.mnemonic
 }
 
 func (w *SPVWallet) ConnectedPeers() []*peer.Peer {
-	return w.peerManager.ConnectedPeers()
+	return w.peerManager.ReadyPeers()
 }
 
 func (w *SPVWallet) CurrentAddress(purpose wallet.KeyPurpose) btc.Address {
@@ -230,7 +204,7 @@ func (w *SPVWallet) CurrentAddress(purpose wallet.KeyPurpose) btc.Address {
 
 func (w *SPVWallet) NewAddress(purpose wallet.KeyPurpose) btc.Address {
 	i, _ := w.txstore.Keys().GetUnused(purpose)
-	key, _ := w.keyManager.generateChildKey(purpose, uint32(i[1]))
+	key, _ := w.keyManager.GenerateChildKey(purpose, uint32(i[1]))
 	addr, _ := key.Address(w.params)
 	w.txstore.Keys().MarkKeyAsUsed(addr.ScriptAddress())
 	w.txstore.PopulateAdrs()
@@ -242,16 +216,12 @@ func (w *SPVWallet) DecodeAddress(addr string) (btc.Address, error) {
 }
 
 func (w *SPVWallet) ScriptToAddress(script []byte) (btc.Address, error) {
-	return scriptToAddress(script, w.params)
-}
-
-func scriptToAddress(script []byte, params *chaincfg.Params) (btc.Address, error) {
-	_, addrs, _, err := txscript.ExtractPkScriptAddrs(script, params)
+	_, addrs, _, err := txscript.ExtractPkScriptAddrs(script, w.params)
 	if err != nil {
-		return &btc.AddressPubKeyHash{}, err
+		return nil, err
 	}
 	if len(addrs) == 0 {
-		return &btc.AddressPubKeyHash{}, errors.New("unknown script")
+		return nil, errors.New("unknown script")
 	}
 	return addrs[0], nil
 }
@@ -322,37 +292,7 @@ func (w *SPVWallet) Balance() (confirmed, unconfirmed int64) {
 }
 
 func (w *SPVWallet) Transactions() ([]wallet.Txn, error) {
-	height, _ := w.ChainTip()
-	txns, err := w.txstore.Txns().GetAll(false)
-	if err != nil {
-		return txns, err
-	}
-	for i, tx := range txns {
-		var confirmations int32
-		var status wallet.StatusCode
-		confs := int32(height) - tx.Height + 1
-		if tx.Height <= 0 {
-			confs = tx.Height
-		}
-		switch {
-		case confs < 0:
-			status = wallet.StatusDead
-		case confs == 0 && time.Since(tx.Timestamp) <= time.Hour*6:
-			status = wallet.StatusUnconfirmed
-		case confs == 0 && time.Since(tx.Timestamp) > time.Hour*6:
-			status = wallet.StatusDead
-		case confs > 0 && confs < 6:
-			status = wallet.StatusPending
-			confirmations = confs
-		case confs > 5:
-			status = wallet.StatusConfirmed
-			confirmations = confs
-		}
-		tx.Confirmations = int64(confirmations)
-		tx.Status = status
-		txns[i] = tx
-	}
-	return txns, nil
+	return w.txstore.Txns().GetAll(false)
 }
 
 func (w *SPVWallet) GetTransaction(txid chainhash.Hash) (wallet.Txn, error) {
@@ -410,15 +350,13 @@ func (w *SPVWallet) ChainTip() (uint32, chainhash.Hash) {
 	return sh.height, sh.header.BlockHash()
 }
 
-func (w *SPVWallet) AddWatchedAddress(addr btc.Address) error {
-	script, err := w.AddressToScript(addr)
-	if err != nil {
-		return err
-	}
-	err = w.txstore.WatchedScripts().Put(script)
+func (w *SPVWallet) AddWatchedScript(script []byte) error {
+	err := w.txstore.WatchedScripts().Put(script)
 	w.txstore.PopulateAdrs()
 
-	w.wireService.MsgChan() <- updateFiltersMsg{}
+	for _, peer := range w.peerManager.ReadyPeers() {
+		w.updateFilterAndSend(peer)
+	}
 	return err
 }
 
@@ -431,17 +369,20 @@ func (w *SPVWallet) Close() {
 		log.Info("Disconnecting from peers and shutting down")
 		w.peerManager.Stop()
 		w.blockchain.Close()
-		w.wireService.Stop()
+		w.stopChan <- 1
 		w.running = false
 	}
 }
 
 func (w *SPVWallet) ReSyncBlockchain(fromDate time.Time) {
+	w.peerManager.Stop()
 	w.blockchain.Rollback(fromDate)
+	w.blockchain.SetChainState(SYNCING)
 	w.txstore.PopulateAdrs()
-	w.wireService.Resync()
-}
-
-func (w *SPVWallet) ExchangeRates() wallet.ExchangeRates {
-	return w.exchangeRates
+	var err error
+	w.peerManager, err = NewPeerManager(w.config)
+	if err != nil {
+		return
+	}
+	go w.peerManager.Start()
 }

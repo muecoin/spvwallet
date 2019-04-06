@@ -3,13 +3,15 @@ package api
 import (
 	"encoding/hex"
 	"errors"
-	"github.com/OpenBazaar/spvwallet"
-	"github.com/OpenBazaar/spvwallet/api/pb"
-	"github.com/OpenBazaar/wallet-interface"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcutil"
-	"github.com/btcsuite/btcutil/hdkeychain"
+	"github.com/muecoin/spvwallet"
+	"github.com/muecoin/spvwallet/api/pb"
+	"github.com/muecoin/wallet-interface"
+	"github.com/muecoin/btcd/chaincfg"
+	"github.com/muecoin/btcd/chaincfg/chainhash"
+	"github.com/muecoin/btcd/txscript"
+	"github.com/muecoin/btcd/wire"
+	"github.com/muecoin/btcutil"
+	"github.com/muecoin/btcutil/hdkeychain"
 	"github.com/golang/protobuf/ptypes"
 	"github.com/golang/protobuf/ptypes/timestamp"
 	"golang.org/x/net/context"
@@ -252,27 +254,37 @@ func (s *server) Peers(ctx context.Context, in *pb.Empty) (*pb.PeerList, error) 
 	return &pb.PeerList{peers}, nil
 }
 
-func (s *server) AddWatchedAddress(ctx context.Context, in *pb.Address) (*pb.Empty, error) {
-	params, err := s.Params(ctx, &pb.Empty{})
-	if err != nil {
-		return nil, err
+func (s *server) AddWatchedScript(ctx context.Context, in *pb.Address) (*pb.Empty, error) {
+	script, err := hex.DecodeString(in.Addr)
+	if err == nil {
+		return nil, s.w.AddWatchedScript(script)
+	} else {
+		params, err := s.Params(ctx, &pb.Empty{})
+		if err != nil {
+			return nil, err
+		}
+		var p chaincfg.Params
+		switch params.Name {
+		case chaincfg.TestNet3Params.Name:
+			p = chaincfg.TestNet3Params
+		case chaincfg.MainNetParams.Name:
+			p = chaincfg.MainNetParams
+		case chaincfg.RegressionNetParams.Name:
+			p = chaincfg.RegressionNetParams
+		default:
+			return nil, errors.New("Unknown network parameters")
+		}
+		addr, err := btcutil.DecodeAddress(in.Addr, &p)
+		if err != nil {
+			return nil, err
+		}
+		script, err := txscript.PayToAddrScript(addr)
+		if err != nil {
+			return nil, err
+		}
+		return nil, s.w.AddWatchedScript(script)
 	}
-	var p chaincfg.Params
-	switch params.Name {
-	case chaincfg.TestNet3Params.Name:
-		p = chaincfg.TestNet3Params
-	case chaincfg.MainNetParams.Name:
-		p = chaincfg.MainNetParams
-	case chaincfg.RegressionNetParams.Name:
-		p = chaincfg.RegressionNetParams
-	default:
-		return nil, errors.New("Unknown network parameters")
-	}
-	addr, err := btcutil.DecodeAddress(in.Addr, &p)
-	if err != nil {
-		return nil, err
-	}
-	return nil, s.w.AddWatchedAddress(addr)
+	return nil, nil
 }
 
 func (s *server) GetConfirmations(ctx context.Context, in *pb.Txid) (*pb.Confirmations, error) {
@@ -288,18 +300,18 @@ func (s *server) GetConfirmations(ctx context.Context, in *pb.Txid) (*pb.Confirm
 }
 
 func (s *server) SweepAddress(ctx context.Context, in *pb.SweepInfo) (*pb.Txid, error) {
-	var ins []wallet.TransactionInput
+	var utxos []wallet.Utxo
 	for _, u := range in.Utxos {
 		h, err := chainhash.NewHashFromStr(u.Txid)
 		if err != nil {
 			return nil, err
 		}
-		in := wallet.TransactionInput{
-			OutpointHash:  h.CloneBytes(),
-			OutpointIndex: u.Index,
-			Value:         int64(u.Value),
+		op := wire.NewOutPoint(h, u.Index)
+		utxo := wallet.Utxo{
+			Op:    *op,
+			Value: int64(u.Value),
 		}
-		ins = append(ins, in)
+		utxos = append(utxos, utxo)
 	}
 	params, err := s.Params(ctx, &pb.Empty{})
 	if err != nil {
@@ -370,7 +382,7 @@ func (s *server) SweepAddress(ctx context.Context, in *pb.SweepInfo) (*pb.Txid, 
 	default:
 		return nil, errors.New("Unknown fee level")
 	}
-	newTxid, err := s.w.SweepAddress(ins, addr, key, rs, feeLevel)
+	newTxid, err := s.w.SweepAddress(utxos, addr, key, rs, feeLevel)
 	if err != nil {
 		return nil, err
 	}
@@ -401,13 +413,9 @@ func (s *server) CreateMultisigSignature(ctx context.Context, in *pb.CreateMulti
 	}
 	var outs []wallet.TransactionOutput
 	for _, output := range in.Outputs {
-		addr, err := s.w.ScriptToAddress(output.ScriptPubKey)
-		if err != nil {
-			return nil, err
-		}
 		o := wallet.TransactionOutput{
-			Address: addr,
-			Value:   int64(output.Value),
+			ScriptPubKey: output.ScriptPubKey,
+			Value:        int64(output.Value),
 		}
 		outs = append(outs, o)
 	}
@@ -485,13 +493,9 @@ func (s *server) Multisign(ctx context.Context, in *pb.MultisignInfo) (*pb.RawTx
 	}
 	var outs []wallet.TransactionOutput
 	for _, output := range in.Outputs {
-		addr, err := s.w.ScriptToAddress(output.ScriptPubKey)
-		if err != nil {
-			return nil, err
-		}
 		o := wallet.TransactionOutput{
-			Address: addr,
-			Value:   int64(output.Value),
+			ScriptPubKey: output.ScriptPubKey,
+			Value:        int64(output.Value),
 		}
 		outs = append(outs, o)
 	}
@@ -533,13 +537,9 @@ func (s *server) EstimateFee(ctx context.Context, in *pb.EstimateFeeData) (*pb.F
 	}
 	var outs []wallet.TransactionOutput
 	for _, output := range in.Outputs {
-		addr, err := s.w.ScriptToAddress(output.ScriptPubKey)
-		if err != nil {
-			return nil, err
-		}
 		o := wallet.TransactionOutput{
-			Address: addr,
-			Value:   int64(output.Value),
+			ScriptPubKey: output.ScriptPubKey,
+			Value:        int64(output.Value),
 		}
 		outs = append(outs, o)
 	}
@@ -554,7 +554,7 @@ func (s *server) WalletNotify(in *pb.Empty, stream pb.API_WalletNotifyServer) er
 			return
 		}
 		resp := &pb.Tx{
-			Txid:      tx.Txid,
+			Txid:      hex.EncodeToString(tx.Txid),
 			Value:     tx.Value,
 			Height:    tx.Height,
 			Timestamp: ts,

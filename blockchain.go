@@ -4,11 +4,11 @@
 package spvwallet
 
 import (
-	"errors"
-	"github.com/btcsuite/btcd/blockchain"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcd/chaincfg/chainhash"
-	"github.com/btcsuite/btcd/wire"
+	"fmt"
+	"github.com/muecoin/btcd/blockchain"
+	"github.com/muecoin/btcd/chaincfg"
+	"github.com/muecoin/btcd/chaincfg/chainhash"
+	"github.com/muecoin/btcd/wire"
 	"math/big"
 	"sort"
 	"sync"
@@ -28,13 +28,19 @@ const (
 	medianTimeBlocks    = 11
 )
 
-var OrphanHeaderError = errors.New("header does not extend any known headers")
+type ChainState int
+
+const (
+	SYNCING = 0
+	WAITING = 1
+)
 
 // Wrapper around Headers implementation that handles all blockchain operations
 type Blockchain struct {
 	lock        *sync.Mutex
 	params      *chaincfg.Params
 	db          Headers
+	state       ChainState
 	crationDate time.Time
 }
 
@@ -53,7 +59,7 @@ func NewBlockchain(filePath string, walletCreationDate time.Time, params *chainc
 	h, err := b.db.Height()
 	if h == 0 || err != nil {
 		log.Info("Initializing headers db with checkpoints")
-		checkpoint := GetCheckpoint(walletCreationDate, params)
+		checkpoint := GetCheckpoint(walletCreationDate)
 		// Put the checkpoint to the db
 		sh := StoredHeader{
 			header:    checkpoint.Header,
@@ -88,7 +94,7 @@ func (b *Blockchain) CommitHeader(header wire.BlockHeader) (bool, *StoredHeader,
 	} else {
 		parentHeader, err = b.db.GetPreviousHeader(header)
 		if err != nil {
-			return false, nil, 0, OrphanHeaderError
+			return false, nil, 0, fmt.Errorf("Header %s does not extend any known headers", header.BlockHash().String())
 		}
 	}
 	valid := b.CheckHeader(header, parentHeader)
@@ -258,7 +264,7 @@ func (b *Blockchain) GetNPrevBlockHashes(n int) []*chainhash.Hash {
 	return ret
 }
 
-func (b *Blockchain) GetBlockLocator() blockchain.BlockLocator {
+func (b *Blockchain) GetBlockLocatorHashes() []*chainhash.Hash {
 	var ret []*chainhash.Hash
 	parent, err := b.db.GetBestHeader()
 	if err != nil {
@@ -293,7 +299,7 @@ func (b *Blockchain) GetBlockLocator() blockchain.BlockLocator {
 		}
 		start += 1
 	}
-	return blockchain.BlockLocator(ret)
+	return ret
 }
 
 // Returns last header before reorg point
@@ -345,7 +351,7 @@ func (b *Blockchain) GetCommonAncestor(bestHeader, prevBestHeader StoredHeader) 
 func (b *Blockchain) Rollback(t time.Time) error {
 	b.lock.Lock()
 	defer b.lock.Unlock()
-	checkpoint := GetCheckpoint(b.crationDate, b.params)
+	checkpoint := GetCheckpoint(b.crationDate)
 	checkPointHash := checkpoint.Header.BlockHash()
 	sh, err := b.db.GetBestHeader()
 	if err != nil {
@@ -385,20 +391,12 @@ func (b *Blockchain) Rollback(t time.Time) error {
 	return b.db.Put(sh, true)
 }
 
-func (b *Blockchain) BestBlock() (StoredHeader, error) {
-	sh, err := b.db.GetBestHeader()
-	if err != nil {
-		return StoredHeader{}, err
-	}
-	return sh, nil
+func (b *Blockchain) ChainState() ChainState {
+	return b.state
 }
 
-func (b *Blockchain) GetHeader(hash *chainhash.Hash) (StoredHeader, error) {
-	sh, err := b.db.GetHeader(*hash)
-	if err != nil {
-		return sh, err
-	}
-	return sh, nil
+func (b *Blockchain) SetChainState(state ChainState) {
+	b.state = state
 }
 
 func (b *Blockchain) Close() {

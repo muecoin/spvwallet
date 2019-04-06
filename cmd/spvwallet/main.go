@@ -4,19 +4,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-
-	"github.com/OpenBazaar/spvwallet"
-	"github.com/OpenBazaar/spvwallet/api"
-	"github.com/OpenBazaar/spvwallet/cli"
-	"github.com/OpenBazaar/spvwallet/db"
-	"github.com/OpenBazaar/spvwallet/gui"
-	"github.com/OpenBazaar/spvwallet/gui/bootstrap"
-	wi "github.com/OpenBazaar/wallet-interface"
+	"github.com/OpenBazaar/openbazaar-go/bitcoin/exchange"
+	"github.com/muecoin/spvwallet"
+	"github.com/muecoin/spvwallet/api"
+	"github.com/muecoin/spvwallet/cli"
+	"github.com/muecoin/spvwallet/db"
+	"github.com/muecoin/spvwallet/gui"
+	"github.com/muecoin/spvwallet/gui/bootstrap"
+	wi "github.com/muecoin/wallet-interface"
 	"github.com/asticode/go-astilectron"
 	"github.com/asticode/go-astilog"
 	"github.com/atotto/clipboard"
-	"github.com/btcsuite/btcd/chaincfg"
-	"github.com/btcsuite/btcutil"
+	"github.com/muecoin/btcd/chaincfg"
+	"github.com/muecoin/btcutil"
 	"github.com/fatih/color"
 	"github.com/jessevdk/go-flags"
 	"github.com/natefinch/lumberjack"
@@ -31,7 +31,6 @@ import (
 	"os/signal"
 	"path"
 	"strings"
-	"sync"
 	"time"
 )
 
@@ -51,7 +50,6 @@ type Start struct {
 	MediumDefaultFee   uint64 `short:"n" long:"normalfee" description:"the default medium fee-per-byte" default:"160"`
 	HighDefaultFee     uint64 `short:"p" long:"priorityfee" description:"the default high fee-per-byte" default:"180"`
 	Gui                bool   `long:"gui" description:"launch an experimental GUI"`
-	Verbose            bool   `short:"v" long:"verbose" description:"print to standard out"`
 }
 type Version struct{}
 
@@ -158,7 +156,6 @@ func (x *Start) Execute(args []string) error {
 
 	// Make the logging a little prettier
 	var fileLogFormat = logging.MustStringFormatter(`%{time:15:04:05.000} [%{shortfunc}] [%{level}] %{message}`)
-	var stdoutLogFormat = logging.MustStringFormatter(`%{color:reset}%{color}%{time:15:04:05.000} [%{shortfunc}] [%{level}] %{message}`)
 	w := &lumberjack.Logger{
 		Filename:   path.Join(config.RepoPath, "logs", "bitcoin.log"),
 		MaxSize:    10, // Megabytes
@@ -168,11 +165,6 @@ func (x *Start) Execute(args []string) error {
 	bitcoinFile := logging.NewLogBackend(w, "", 0)
 	bitcoinFileFormatter := logging.NewBackendFormatter(bitcoinFile, fileLogFormat)
 	config.Logger = logging.MultiLogger(logging.MultiLogger(bitcoinFileFormatter))
-	if x.Verbose {
-		stdoutLog := logging.NewLogBackend(os.Stdout, "", 0)
-		stdoutFormatter := logging.NewBackendFormatter(stdoutLog, stdoutLogFormat)
-		config.Logger = logging.MultiLogger(logging.MultiLogger(stdoutFormatter))
-	}
 
 	// Select wallet datastore
 	sqliteDatastore, _ := db.Create(config.RepoPath)
@@ -181,10 +173,6 @@ func (x *Start) Execute(args []string) error {
 	mn, _ := sqliteDatastore.GetMnemonic()
 	if mn != "" {
 		config.Mnemonic = mn
-	}
-	cd, err := sqliteDatastore.GetCreationDate()
-	if err == nil {
-		config.CreationDate = cd
 	}
 
 	// Write version file
@@ -274,13 +262,14 @@ func (x *Start) Execute(args []string) error {
 	config.MediumFee = settings.Fees.Normal
 	config.LowFee = settings.Fees.Economic
 
+	creationDate := time.Time{}
 	if x.WalletCreationDate != "" {
-		creationDate, err := time.Parse(time.RFC3339, x.WalletCreationDate)
+		creationDate, err = time.Parse(time.RFC3339, x.WalletCreationDate)
 		if err != nil {
 			return errors.New("Wallet creation date timestamp must be in RFC3339 format")
 		}
-		config.CreationDate = creationDate
 	}
+	config.CreationDate = creationDate
 
 	// Create the wallet
 	wallet, err = spvwallet.NewSPVWallet(config)
@@ -302,6 +291,8 @@ func (x *Start) Execute(args []string) error {
 
 	if x.Gui {
 		go wallet.Start()
+
+		exchangeRates := exchange.NewBitcoinPriceFetcher(nil)
 
 		type Stats struct {
 			Confirmed    int64  `json:"confirmed"`
@@ -363,7 +354,7 @@ func (x *Start) Execute(args []string) error {
 						astilog.Errorf(err.Error())
 						return
 					}
-					rate, err := wallet.ExchangeRates().GetExchangeRate(p.CurrencyCode)
+					rate, err := exchangeRates.GetExchangeRate(p.CurrencyCode)
 					if err != nil {
 						astilog.Errorf("Failed to get exchange rate")
 						return
@@ -379,10 +370,10 @@ func (x *Start) Execute(args []string) error {
 						Height:       height,
 						ExchangeRate: fmt.Sprintf("%.2f", rate),
 					}
-					w.SendMessage(bootstrap.MessageOut{Name: "statsUpdate", Payload: st})
+					w.Send(bootstrap.MessageOut{Name: "statsUpdate", Payload: st})
 				case "getAddress":
 					addr := wallet.CurrentAddress(wi.EXTERNAL)
-					w.SendMessage(bootstrap.MessageOut{Name: "address", Payload: addr.EncodeAddress()})
+					w.Send(bootstrap.MessageOut{Name: "address", Payload: addr.EncodeAddress()})
 				case "send":
 					type P struct {
 						Address  string  `json:"address"`
@@ -408,12 +399,12 @@ func (x *Start) Execute(args []string) error {
 					}
 					addr, err := btcutil.DecodeAddress(p.Address, wallet.Params())
 					if err != nil {
-						w.SendMessage(bootstrap.MessageOut{Name: "spendError", Payload: "Invalid address"})
+						w.Send(bootstrap.MessageOut{Name: "spendError", Payload: "Invalid address"})
 						return
 					}
 					_, err = wallet.Spend(int64(p.Amount), addr, feeLevel)
 					if err != nil {
-						w.SendMessage(bootstrap.MessageOut{Name: "spendError", Payload: err.Error()})
+						w.Send(bootstrap.MessageOut{Name: "spendError", Payload: err.Error()})
 					}
 				case "clipboard":
 					type P struct {
@@ -454,7 +445,7 @@ func (x *Start) Execute(args []string) error {
 					if err != nil {
 						astilog.Error(err.Error())
 					}
-					w.SendMessage(bootstrap.MessageOut{Name: "settings", Payload: string(settings)})
+					w.Send(bootstrap.MessageOut{Name: "settings", Payload: string(settings)})
 				case "openbrowser":
 					var url string
 					if err := json.Unmarshal(m.Payload, &url); err != nil {
@@ -496,15 +487,15 @@ func (x *Start) Execute(args []string) error {
 					}()
 					txs, err := wallet.Transactions()
 					if err != nil {
-						w.SendMessage(bootstrap.MessageOut{Name: "txError", Payload: err.Error()})
+						w.Send(bootstrap.MessageOut{Name: "txError", Payload: err.Error()})
 					}
-					w.SendMessage(bootstrap.MessageOut{Name: "transactions", Payload: txs})
+					w.Send(bootstrap.MessageOut{Name: "transactions", Payload: txs})
 				case "getTransactions":
 					txs, err := wallet.Transactions()
 					if err != nil {
-						w.SendMessage(bootstrap.MessageOut{Name: "txError", Payload: err.Error()})
+						w.Send(bootstrap.MessageOut{Name: "txError", Payload: err.Error()})
 					}
-					w.SendMessage(bootstrap.MessageOut{Name: "transactions", Payload: txs})
+					w.Send(bootstrap.MessageOut{Name: "transactions", Payload: txs})
 				case "hide":
 					go func() {
 						rc <- 341
@@ -514,7 +505,7 @@ func (x *Start) Execute(args []string) error {
 						rc <- 649
 					}()
 				case "getMnemonic":
-					w.SendMessage(bootstrap.MessageOut{Name: "mnemonic", Payload: wallet.Mnemonic()})
+					w.Send(bootstrap.MessageOut{Name: "mnemonic", Payload: wallet.Mnemonic()})
 				}
 			},
 			RestoreAssets: gui.RestoreAssets,
@@ -540,9 +531,6 @@ func (x *Start) Execute(args []string) error {
 		}
 	} else {
 		wallet.Start()
-		var wg sync.WaitGroup
-		wg.Add(1)
-		wg.Wait()
 	}
 	return nil
 }

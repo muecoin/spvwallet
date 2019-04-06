@@ -2,7 +2,7 @@ package spvwallet
 
 import (
 	"bytes"
-	"github.com/OpenBazaar/wallet-interface"
+	"github.com/muecoin/wallet-interface"
 	"net/http"
 	"testing"
 )
@@ -40,7 +40,7 @@ func TestFeeProvider_GetFeePerByte(t *testing.T) {
 	if fp.GetFeePerByte(wallet.ECONOMIC) != 390 {
 		t.Error("Returned incorrect fee per byte")
 	}
-	if fp.GetFeePerByte(wallet.FEE_BUMP) != 450 {
+	if fp.GetFeePerByte(wallet.FEE_BUMP) != 900 {
 		t.Error("Returned incorrect fee per byte")
 	}
 
@@ -70,7 +70,7 @@ func TestFeeProvider_GetFeePerByte(t *testing.T) {
 	if fp.GetFeePerByte(wallet.ECONOMIC) != 280 {
 		t.Error("Returned incorrect fee per byte")
 	}
-	if fp.GetFeePerByte(wallet.FEE_BUMP) != 360 {
+	if fp.GetFeePerByte(wallet.FEE_BUMP) != 720 {
 		t.Error("Returned incorrect fee per byte")
 	}
 }
